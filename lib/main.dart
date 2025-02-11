@@ -1,9 +1,9 @@
 import 'dart:async';
-
+import 'dart:convert';
+import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'dart:convert';
 
 void main() {
   runApp(const WalkieTalkieApp());
@@ -29,7 +29,8 @@ class WalkieTalkiePage extends StatefulWidget {
   WalkieTalkiePageState createState() => WalkieTalkiePageState();
 }
 
-class WalkieTalkiePageState extends State<WalkieTalkiePage> {
+class WalkieTalkiePageState extends State<WalkieTalkiePage>
+    with SingleTickerProviderStateMixin {
   RTCPeerConnection? peerConnection;
   MediaStream? localStream;
   MediaStream? remoteStream;
@@ -42,10 +43,25 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage> {
   List<MediaDeviceInfo> _audioOutputDevices = [];
   String? _selectedAudioOutput;
   Timer? _connectionTimer;
+  late List<double> barHeights;
+  late AnimationController _animationController;
+  final int numberOfBars = 12;
+  List<RTCIceCandidate> _pendingCandidates = [];
+  bool _offerSet = false;
 
   @override
   void initState() {
     super.initState();
+    // Initialize bar heights
+    barHeights = List.generate(numberOfBars, (index) => 0.3);
+
+    // Setup animation controller
+    _animationController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 600),
+    );
+    _animationController.repeat(reverse: true);
+
     _initRenderers();
     _initAudioDevices();
   }
@@ -92,6 +108,7 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage> {
             setState(() {
               isRemoteAudioActive =
                   audioLevel > 0.01; // Adjust threshold as needed
+              _updateVisualizerBars();
             });
           }
         });
@@ -112,53 +129,36 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage> {
     });
 
     try {
-      // Get audio stream with specific constraints
-      localStream = await navigator.mediaDevices.getUserMedia({
-        'audio': {
-          'echoCancellation': true,
-          'noiseSuppression': true,
-          'autoGainControl': true
-        },
-        'video': false
-      });
-
-      setState(() {
-        connectionStatus = 'Creating peer connection...';
-      });
-
-      // Create peer connection with specific configuration
+      // Create peer connection first
       peerConnection = await createPeerConnection({
         'iceServers': [
           {
             'urls': [
+              'stun:stun.l.google.com:19302',
               'stun:stun1.l.google.com:19302',
-              'stun:stun2.l.google.com:19302'
             ]
           }
         ],
         'sdpSemantics': 'unified-plan',
-        'mandatory': {
-          'OfferToReceiveAudio': true,
-          'OfferToReceiveVideo': false
+        'iceTransportPolicy': 'all',
+      });
+
+      // Get audio stream
+      localStream = await navigator.mediaDevices.getUserMedia({
+        'audio': {
+          'echoCancellation': true,
+          'noiseSuppression': true,
+          'autoGainControl': true,
         },
+        'video': false
       });
 
-      // Add connection timeout
-      _connectionTimer?.cancel();
-      _connectionTimer = Timer(const Duration(seconds: 30), () {
-        if (!isConnected) {
-          setState(() {
-            connectionStatus = 'Connection timeout. Please try again.';
-          });
-        }
-      });
-
-      // Add local stream tracks to peer connection
+      // Add tracks to peer connection
       localStream!.getTracks().forEach((track) {
         peerConnection!.addTrack(track, localStream!);
       });
 
-      // Handle connection state changes
+      // Handle connection state changes with more detailed logging
       peerConnection!.onConnectionState = (RTCPeerConnectionState state) {
         print('Connection state changed to: $state');
         setState(() {
@@ -169,12 +169,10 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage> {
               _connectionTimer?.cancel();
               break;
             case RTCPeerConnectionState.RTCPeerConnectionStateFailed:
-              connectionStatus =
-                  'Connection failed. Please reset and try again.';
-              isConnected = false;
+              _handleConnectionFailure();
               break;
             case RTCPeerConnectionState.RTCPeerConnectionStateDisconnected:
-              connectionStatus = 'Disconnected';
+              connectionStatus = 'Disconnected - Trying to reconnect...';
               isConnected = false;
               break;
             default:
@@ -183,68 +181,53 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage> {
         });
       };
 
-      // Handle ICE connection state changes
-      peerConnection!.onIceConnectionState = (RTCIceConnectionState state) {
-        print('ICE state changed to: $state');
-        setState(() {
-          switch (state) {
-            case RTCIceConnectionState.RTCIceConnectionStateConnected:
-              connectionStatus = 'ICE Connected';
-              break;
-            case RTCIceConnectionState.RTCIceConnectionStateFailed:
-              connectionStatus = 'ICE Connection failed. Try resetting.';
-              break;
-            default:
-              // Don't update status for other ICE states to avoid confusion
-              break;
-          }
-        });
-      };
-
-      // Handle ICE candidates
+      // Improved ICE candidate handling
       peerConnection!.onIceCandidate = (candidate) {
+        print('Generated ICE candidate: ${candidate.candidate}');
         if (candidate.candidate != null) {
-          _sharePeerInfo('ice', {
-            'candidate': candidate.toMap(),
-          });
+          if (_offerSet) {
+            _sharePeerInfo('ice', {'candidate': candidate.toMap()});
+          } else {
+            _pendingCandidates.add(candidate);
+          }
         }
       };
 
-      // Handle remote stream
-      peerConnection!.onTrack = (RTCTrackEvent event) {
-        if (event.streams.isNotEmpty) {
-          print('Received remote track: ${event.track.kind}');
-
-          if (event.track.kind == 'audio') {
-            print('Audio track received. Enabled: ${event.track.enabled}');
-            event.track.onEnded = () {
-              print('Audio track ended');
-            };
-            event.track.onMute = () {
-              print('Audio track muted');
-            };
-            event.track.onUnMute = () {
-              print('Audio track unmuted');
-            };
-          }
-
+      // Handle ICE connection state
+      peerConnection!.onIceConnectionState = (RTCIceConnectionState state) {
+        print('ICE Connection State: $state');
+        if (state == RTCIceConnectionState.RTCIceConnectionStateConnected) {
           setState(() {
-            remoteStream = event.streams[0];
-            _remoteRenderer.srcObject = remoteStream;
             isConnected = true;
-            connectionStatus = 'Remote stream received';
+            connectionStatus = 'Connected';
           });
-
-          // Start monitoring audio levels
-          _startAudioLevelMonitoring(event.streams[0]);
         }
       };
 
       // Start the offer/answer process
-      _checkAndCreateOffer();
+      await _checkAndCreateOffer();
     } catch (e) {
+      print('WebRTC initialization error: $e');
       setState(() {
         connectionStatus = 'Error: $e';
+      });
+    }
+  }
+
+  void _handleConnectionFailure() async {
+    print('Connection failed - attempting recovery');
+    setState(() {
+      connectionStatus = 'Connection failed - attempting recovery...';
+      isConnected = false;
+    });
+
+    try {
+      await peerConnection?.close();
+      await _initWebRTC();
+    } catch (e) {
+      print('Recovery failed: $e');
+      setState(() {
+        connectionStatus = 'Recovery failed. Please reset manually.';
       });
     }
   }
@@ -259,19 +242,22 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage> {
           connectionStatus = 'Creating offer...';
         });
 
-        // Create offer with specific constraints
-        final offer = await peerConnection!.createOffer(
-            {'offerToReceiveAudio': true, 'offerToReceiveVideo': false});
+        final offer = await peerConnection!.createOffer();
+        print('Created offer: ${offer.sdp}');
 
         await peerConnection!.setLocalDescription(offer);
+        _offerSet = true;
+
+        // Share pending candidates
+        for (var candidate in _pendingCandidates) {
+          await _sharePeerInfo('ice', {'candidate': candidate.toMap()});
+        }
+        _pendingCandidates.clear();
 
         await _sharePeerInfo('offer', {
           'sdp': offer.sdp,
           'type': offer.type,
-        });
-
-        setState(() {
-          connectionStatus = 'Offer created and shared';
+          'timestamp': DateTime.now().millisecondsSinceEpoch,
         });
       } else {
         setState(() {
@@ -279,25 +265,33 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage> {
         });
 
         final offerData = jsonDecode(existingOffer);
+        print('Processing offer: ${offerData['sdp']}');
+
         await peerConnection!.setRemoteDescription(
           RTCSessionDescription(offerData['sdp'], offerData['type']),
         );
+        _offerSet = true;
 
-        final answer = await peerConnection!.createAnswer(
-            {'offerToReceiveAudio': true, 'offerToReceiveVideo': false});
-
+        final answer = await peerConnection!.createAnswer();
         await peerConnection!.setLocalDescription(answer);
+
+        // Share pending candidates
+        for (var candidate in _pendingCandidates) {
+          await _sharePeerInfo('ice', {'candidate': candidate.toMap()});
+        }
+        _pendingCandidates.clear();
 
         await _sharePeerInfo('answer', {
           'sdp': answer.sdp,
           'type': answer.type,
+          'timestamp': DateTime.now().millisecondsSinceEpoch,
         });
 
-        setState(() {
-          connectionStatus = 'Answer created and shared';
-        });
+        // Immediately check for ICE candidates after processing offer
+        await _checkForIceCandidates();
       }
     } catch (e) {
+      print('Offer/Answer error: $e');
       setState(() {
         connectionStatus = 'Error in offer/answer: $e';
       });
@@ -328,15 +322,20 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage> {
     final candidates = prefs.getStringList('ice_candidates') ?? [];
 
     for (final candidateJson in candidates) {
-      final data = jsonDecode(candidateJson);
-      if (data['type'] == 'ice') {
-        await peerConnection!.addCandidate(
-          RTCIceCandidate(
-            data['candidate']['candidate'],
-            data['candidate']['sdpMid'],
-            data['candidate']['sdpMLineIndex'],
-          ),
-        );
+      try {
+        final data = jsonDecode(candidateJson);
+        if (data['type'] == 'ice') {
+          print('Adding ICE candidate: ${data['candidate']['candidate']}');
+          await peerConnection!.addCandidate(
+            RTCIceCandidate(
+              data['candidate']['candidate'],
+              data['candidate']['sdpMid'],
+              data['candidate']['sdpMLineIndex'],
+            ),
+          );
+        }
+      } catch (e) {
+        print('Error adding ICE candidate: $e');
       }
     }
   }
@@ -369,6 +368,21 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage> {
     await _initWebRTC();
   }
 
+  void _updateVisualizerBars() {
+    if (!isRemoteAudioActive) {
+      setState(() {
+        barHeights = List.generate(numberOfBars, (index) => 0.3);
+      });
+      return;
+    }
+
+    setState(() {
+      barHeights = List.generate(numberOfBars, (index) {
+        return 0.3 + Random().nextDouble() * 0.7;
+      });
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -383,14 +397,54 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage> {
               textAlign: TextAlign.center,
             ),
             const SizedBox(height: 20),
-            // Add the AudioWave widget through HtmlElementView
-            SizedBox(
-              height: 100,
-              child: HtmlElementView(
-                viewType: 'audio-wave',
-                onPlatformViewCreated: (int id) {
-                  // Initialize the audio wave component
-                  // The JavaScript side will handle the actual rendering
+            // New audio visualizer
+            Container(
+              height: 120,
+              width: 300,
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              decoration: BoxDecoration(
+                color: Colors.grey[100],
+                borderRadius: BorderRadius.circular(16),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.1),
+                    blurRadius: 10,
+                    spreadRadius: 1,
+                  ),
+                ],
+              ),
+              child: AnimatedBuilder(
+                animation: _animationController,
+                builder: (context, child) {
+                  return Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                    children: List.generate(
+                      numberOfBars,
+                      (index) => AnimatedContainer(
+                        duration: const Duration(milliseconds: 200),
+                        width: 12,
+                        height: 80 * barHeights[index],
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(20),
+                          gradient: LinearGradient(
+                            begin: Alignment.bottomCenter,
+                            end: Alignment.topCenter,
+                            colors: isRemoteAudioActive
+                                ? [
+                                    Colors.blue[300]!,
+                                    Colors.blue[400]!,
+                                    Colors.blue[600]!,
+                                  ]
+                                : [
+                                    Colors.grey[300]!,
+                                    Colors.grey[400]!,
+                                    Colors.grey[500]!,
+                                  ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  );
                 },
               ),
             ),
@@ -439,6 +493,7 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage> {
 
   @override
   void dispose() {
+    _animationController.dispose();
     _connectionTimer?.cancel();
     audioLevelTimer?.cancel();
     localStream?.dispose();

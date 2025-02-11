@@ -48,6 +48,11 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage>
   final int numberOfBars = 12;
   List<RTCIceCandidate> _pendingCandidates = [];
   bool _offerSet = false;
+  bool _hasRemoteDescription = false;
+  Timer? _answerCheckTimer;
+  bool _isOfferer = false;
+  Timer? _syncTimer;
+  bool _answerProcessed = false;
 
   @override
   void initState() {
@@ -143,6 +148,11 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage>
         'iceTransportPolicy': 'all',
       });
 
+      // Add signaling state change handler
+      peerConnection!.onSignalingState = (RTCSignalingState state) {
+        print('Signaling State: $state');
+      };
+
       // Get audio stream
       localStream = await navigator.mediaDevices.getUserMedia({
         'audio': {
@@ -167,11 +177,13 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage>
               connectionStatus = 'Connected';
               isConnected = true;
               _connectionTimer?.cancel();
+              _stopSync(); // Stop syncing when connected
               break;
             case RTCPeerConnectionState.RTCPeerConnectionStateFailed:
               _handleConnectionFailure();
               break;
             case RTCPeerConnectionState.RTCPeerConnectionStateDisconnected:
+              _startSync(); // Start syncing when disconnected
               connectionStatus = 'Disconnected - Trying to reconnect...';
               isConnected = false;
               break;
@@ -204,8 +216,26 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage>
         }
       };
 
+      // Add onTrack handler right after creating peer connection
+      peerConnection!.onTrack = (RTCTrackEvent event) {
+        print('Received track: ${event.track.kind}');
+        if (event.streams.isNotEmpty) {
+          setState(() {
+            remoteStream = event.streams[0];
+            _remoteRenderer.srcObject = remoteStream;
+            isConnected = true;
+            connectionStatus = 'Connected - Remote stream received';
+          });
+          _startAudioLevelMonitoring(event.streams[0]);
+        }
+      };
+
       // Start the offer/answer process
       await _checkAndCreateOffer();
+      // Start checking for answer if we create an offer
+      _startAnswerCheck();
+      // Start syncing process
+      _startSync();
     } catch (e) {
       print('WebRTC initialization error: $e');
       setState(() {
@@ -238,63 +268,52 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage>
 
     try {
       if (existingOffer == null) {
-        setState(() {
-          connectionStatus = 'Creating offer...';
+        _isOfferer = true;
+        setState(() => connectionStatus = 'Creating offer...');
+
+        final offer = await peerConnection!.createOffer({
+          'offerToReceiveAudio': true,
+          'offerToReceiveVideo': false,
         });
 
-        final offer = await peerConnection!.createOffer();
-        print('Created offer: ${offer.sdp}');
-
+        print('Setting local description (offer)');
         await peerConnection!.setLocalDescription(offer);
         _offerSet = true;
-
-        // Share pending candidates
-        for (var candidate in _pendingCandidates) {
-          await _sharePeerInfo('ice', {'candidate': candidate.toMap()});
-        }
-        _pendingCandidates.clear();
 
         await _sharePeerInfo('offer', {
           'sdp': offer.sdp,
           'type': offer.type,
-          'timestamp': DateTime.now().millisecondsSinceEpoch,
         });
+        _startSync();
       } else {
-        setState(() {
-          connectionStatus = 'Processing existing offer...';
-        });
+        _isOfferer = false;
+        setState(() => connectionStatus = 'Processing offer...');
 
         final offerData = jsonDecode(existingOffer);
-        print('Processing offer: ${offerData['sdp']}');
-
+        print('Setting remote description (offer)');
         await peerConnection!.setRemoteDescription(
           RTCSessionDescription(offerData['sdp'], offerData['type']),
         );
-        _offerSet = true;
 
+        print('Creating answer');
         final answer = await peerConnection!.createAnswer();
-        await peerConnection!.setLocalDescription(answer);
 
-        // Share pending candidates
-        for (var candidate in _pendingCandidates) {
-          await _sharePeerInfo('ice', {'candidate': candidate.toMap()});
-        }
-        _pendingCandidates.clear();
+        print('Setting local description (answer)');
+        await peerConnection!.setLocalDescription(answer);
 
         await _sharePeerInfo('answer', {
           'sdp': answer.sdp,
           'type': answer.type,
-          'timestamp': DateTime.now().millisecondsSinceEpoch,
         });
 
-        // Immediately check for ICE candidates after processing offer
+        // Check for existing ICE candidates after answer is created
         await _checkForIceCandidates();
+        _answerProcessed = true;
+        _startSync();
       }
     } catch (e) {
       print('Offer/Answer error: $e');
-      setState(() {
-        connectionStatus = 'Error in offer/answer: $e';
-      });
+      setState(() => connectionStatus = 'Error in offer/answer: $e');
     }
   }
 
@@ -303,13 +322,13 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage>
     final peerInfo = {
       'type': type,
       ...data,
+      'timestamp': DateTime.now().millisecondsSinceEpoch,
     };
 
     if (type == 'offer') {
       await prefs.setString('room_offer', jsonEncode(peerInfo));
     } else if (type == 'answer') {
       await prefs.setString('room_answer', jsonEncode(peerInfo));
-      _checkForIceCandidates();
     } else if (type == 'ice') {
       final candidates = prefs.getStringList('ice_candidates') ?? [];
       candidates.add(jsonEncode(peerInfo));
@@ -336,6 +355,99 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage>
         }
       } catch (e) {
         print('Error adding ICE candidate: $e');
+      }
+    }
+  }
+
+  void _startAnswerCheck() {
+    if (!_isOfferer) return; // Only check for answer if we're the offerer
+
+    _answerCheckTimer?.cancel();
+    _answerCheckTimer =
+        Timer.periodic(const Duration(seconds: 1), (timer) async {
+      if (_hasRemoteDescription) {
+        timer.cancel();
+        return;
+      }
+
+      final prefs = await SharedPreferences.getInstance();
+      final answerJson = prefs.getString('room_answer');
+
+      if (answerJson != null) {
+        try {
+          final answerData = jsonDecode(answerJson);
+          print('Setting remote description (answer)');
+          final signalingState = peerConnection?.signalingState;
+          print('Current signaling state: $signalingState');
+
+          if (signalingState ==
+              RTCSignalingState.RTCSignalingStateHaveLocalOffer) {
+            await peerConnection!.setRemoteDescription(
+              RTCSessionDescription(answerData['sdp'], answerData['type']),
+            );
+            _hasRemoteDescription = true;
+            await _checkForIceCandidates();
+          } else {
+            print(
+                'Wrong signaling state for setting remote description: $signalingState');
+          }
+        } catch (e) {
+          print('Error processing answer: $e');
+        }
+      }
+    });
+  }
+
+  void _startSync() {
+    _syncTimer?.cancel();
+    _syncTimer = Timer.periodic(const Duration(seconds: 1), (timer) async {
+      if (isConnected) {
+        timer.cancel();
+        return;
+      }
+      await _syncPeerState();
+    });
+  }
+
+  void _stopSync() {
+    _syncTimer?.cancel();
+  }
+
+  Future<void> _syncPeerState() async {
+    final prefs = await SharedPreferences.getInstance();
+
+    if (_isOfferer) {
+      // Offerer: Check for answer
+      if (!_answerProcessed) {
+        final answerJson = prefs.getString('room_answer');
+        if (answerJson != null) {
+          try {
+            final answerData = jsonDecode(answerJson);
+            if (peerConnection?.signalingState ==
+                RTCSignalingState.RTCSignalingStateHaveLocalOffer) {
+              print('Processing pending answer');
+              await peerConnection!.setRemoteDescription(
+                RTCSessionDescription(answerData['sdp'], answerData['type']),
+              );
+              _answerProcessed = true;
+              await _checkForIceCandidates();
+            }
+          } catch (e) {
+            print('Error processing answer during sync: $e');
+          }
+        }
+      }
+    } else {
+      // Answerer: Check if answer was received
+      if (!_answerProcessed) {
+        final answer = await peerConnection!.getLocalDescription();
+        if (answer != null) {
+          await _sharePeerInfo('answer', {
+            'sdp': answer.sdp,
+            'type': answer.type,
+          });
+          _answerProcessed = true;
+        }
       }
     }
   }
@@ -500,6 +612,8 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage>
     remoteStream?.dispose();
     peerConnection?.dispose();
     _remoteRenderer.dispose();
+    _answerCheckTimer?.cancel();
+    _syncTimer?.cancel();
     super.dispose();
   }
 }

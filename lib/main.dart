@@ -41,6 +41,7 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage> {
   Timer? audioLevelTimer;
   List<MediaDeviceInfo> _audioOutputDevices = [];
   String? _selectedAudioOutput;
+  Timer? _connectionTimer;
 
   @override
   void initState() {
@@ -142,6 +143,16 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage> {
         },
       });
 
+      // Add connection timeout
+      _connectionTimer?.cancel();
+      _connectionTimer = Timer(const Duration(seconds: 30), () {
+        if (!isConnected) {
+          setState(() {
+            connectionStatus = 'Connection timeout. Please try again.';
+          });
+        }
+      });
+
       // Add local stream tracks to peer connection
       localStream!.getTracks().forEach((track) {
         peerConnection!.addTrack(track, localStream!);
@@ -149,17 +160,44 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage> {
 
       // Handle connection state changes
       peerConnection!.onConnectionState = (RTCPeerConnectionState state) {
+        print('Connection state changed to: $state');
         setState(() {
-          connectionStatus = 'Connection state: $state';
-          isConnected =
-              state == RTCPeerConnectionState.RTCPeerConnectionStateConnected;
+          switch (state) {
+            case RTCPeerConnectionState.RTCPeerConnectionStateConnected:
+              connectionStatus = 'Connected';
+              isConnected = true;
+              _connectionTimer?.cancel();
+              break;
+            case RTCPeerConnectionState.RTCPeerConnectionStateFailed:
+              connectionStatus =
+                  'Connection failed. Please reset and try again.';
+              isConnected = false;
+              break;
+            case RTCPeerConnectionState.RTCPeerConnectionStateDisconnected:
+              connectionStatus = 'Disconnected';
+              isConnected = false;
+              break;
+            default:
+              connectionStatus = 'Connection state: $state';
+          }
         });
       };
 
       // Handle ICE connection state changes
       peerConnection!.onIceConnectionState = (RTCIceConnectionState state) {
+        print('ICE state changed to: $state');
         setState(() {
-          connectionStatus = 'ICE state: $state';
+          switch (state) {
+            case RTCIceConnectionState.RTCIceConnectionStateConnected:
+              connectionStatus = 'ICE Connected';
+              break;
+            case RTCIceConnectionState.RTCIceConnectionStateFailed:
+              connectionStatus = 'ICE Connection failed. Try resetting.';
+              break;
+            default:
+              // Don't update status for other ICE states to avoid confusion
+              break;
+          }
         });
       };
 
@@ -312,6 +350,25 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage> {
     });
   }
 
+  Future<void> _resetConnection() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.clear();
+
+    // Clean up existing connections
+    _connectionTimer?.cancel();
+    localStream?.dispose();
+    remoteStream?.dispose();
+    await peerConnection?.close();
+
+    setState(() {
+      isConnected = false;
+      connectionStatus = 'Resetting connection...';
+    });
+
+    // Reinitialize WebRTC
+    await _initWebRTC();
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -349,13 +406,7 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage> {
             ),
             const SizedBox(height: 20),
             ElevatedButton(
-              onPressed: () async {
-                final prefs = await SharedPreferences.getInstance();
-                await prefs.clear();
-                setState(() {
-                  connectionStatus = 'Cleared connection data';
-                });
-              },
+              onPressed: _resetConnection,
               child: const Text('Reset Connection'),
             ),
             if (_audioOutputDevices.isNotEmpty) ...[
@@ -388,6 +439,7 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage> {
 
   @override
   void dispose() {
+    _connectionTimer?.cancel();
     audioLevelTimer?.cancel();
     localStream?.dispose();
     remoteStream?.dispose();

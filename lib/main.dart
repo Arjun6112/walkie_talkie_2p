@@ -4,6 +4,7 @@ import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:socket_io_client/socket_io_client.dart' as IO;
 
 void main() {
   runApp(const WalkieTalkieApp());
@@ -53,6 +54,12 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage>
   bool _isOfferer = false;
   Timer? _syncTimer;
   bool _answerProcessed = false;
+  late IO.Socket socket;
+  String roomId = 'default_room';
+  bool isRoomFull = false;
+  double _volume = 1.0;
+  bool isLocalAudioActive = false;
+  Timer? localAudioLevelTimer;
 
   @override
   void initState() {
@@ -69,6 +76,7 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage>
 
     _initRenderers();
     _initAudioDevices();
+    _connectToSignalingServer();
   }
 
   Future<void> _initAudioDevices() async {
@@ -97,22 +105,23 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage>
     }
   }
 
-  void _startAudioLevelMonitoring(MediaStream stream) {
-    audioLevelTimer?.cancel();
-    audioLevelTimer =
-        Timer.periodic(const Duration(milliseconds: 100), (timer) async {
+  void _startAudioLevelMonitoring(MediaStream stream, bool isLocal) {
+    final timer = Timer.periodic(const Duration(milliseconds: 100), (timer) async {
       if (stream.getAudioTracks().isEmpty) return;
 
       final audioTrack = stream.getAudioTracks().first;
-      // Get audio levels through WebRTC stats
       try {
         final stats = await peerConnection!.getStats(audioTrack);
         stats.forEach((stat) {
-          if (stat.type == 'inbound-rtp' && stat.values['audioLevel'] != null) {
+          if (stat.type == (isLocal ? 'outbound-rtp' : 'inbound-rtp') && 
+              stat.values['audioLevel'] != null) {
             final audioLevel = stat.values['audioLevel'] as double;
             setState(() {
-              isRemoteAudioActive =
-                  audioLevel > 0.01; // Adjust threshold as needed
+              if (isLocal) {
+                isLocalAudioActive = audioLevel > 0.01;
+              } else {
+                isRemoteAudioActive = audioLevel > 0.01;
+              }
               _updateVisualizerBars();
             });
           }
@@ -121,6 +130,14 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage>
         print('Error getting audio levels: $e');
       }
     });
+
+    if (isLocal) {
+      localAudioLevelTimer?.cancel();
+      localAudioLevelTimer = timer;
+    } else {
+      audioLevelTimer?.cancel();
+      audioLevelTimer = timer;
+    }
   }
 
   Future<void> _initRenderers() async {
@@ -163,6 +180,9 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage>
         'video': false
       });
 
+      // Start monitoring local audio
+      _startAudioLevelMonitoring(localStream!, true);
+
       // Add tracks to peer connection
       localStream!.getTracks().forEach((track) {
         peerConnection!.addTrack(track, localStream!);
@@ -197,11 +217,10 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage>
       peerConnection!.onIceCandidate = (candidate) {
         print('Generated ICE candidate: ${candidate.candidate}');
         if (candidate.candidate != null) {
-          if (_offerSet) {
-            _sharePeerInfo('ice', {'candidate': candidate.toMap()});
-          } else {
-            _pendingCandidates.add(candidate);
-          }
+          socket.emit('ice_candidate', {
+            'roomId': roomId,
+            'candidate': candidate.toMap(),
+          });
         }
       };
 
@@ -217,18 +236,40 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage>
       };
 
       // Add onTrack handler right after creating peer connection
-      peerConnection!.onTrack = (RTCTrackEvent event) {
+      peerConnection!.onTrack = (RTCTrackEvent event) async {
         print('Received track: ${event.track.kind}');
-        if (event.streams.isNotEmpty) {
-          setState(() {
-            remoteStream = event.streams[0];
-            _remoteRenderer.srcObject = remoteStream;
-            isConnected = true;
-            connectionStatus = 'Connected - Remote stream received';
-          });
-          _startAudioLevelMonitoring(event.streams[0]);
+        print('Track enabled: ${event.track.enabled}');
+        print('Track muted: ${event.track.muted}');
+
+        if (event.track.kind == 'audio') {
+          event.track.enabled = true;
+          event.track.enableSpeakerphone(true);
+
+          if (event.streams.isNotEmpty) {
+            setState(() {
+              remoteStream = event.streams[0];
+              _remoteRenderer.srcObject = remoteStream;
+              isConnected = true;
+              connectionStatus = 'Connected - Remote audio received';
+            });
+
+            // Ensure audio output is set
+            if (_selectedAudioOutput != null) {
+              await _remoteRenderer.audioOutput(_selectedAudioOutput!);
+            }
+
+            _startAudioLevelMonitoring(event.streams[0], false);
+          }
         }
       };
+
+      // Start the offer process if we're the first peer
+      socket.on('room_status', (data) {
+        if (data['size'] == 1) {
+          _isOfferer = true;
+          _createOffer();
+        }
+      });
 
       // Start the offer/answer process
       await _checkAndCreateOffer();
@@ -481,16 +522,148 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage>
   }
 
   void _updateVisualizerBars() {
-    if (!isRemoteAudioActive) {
-      setState(() {
-        barHeights = List.generate(numberOfBars, (index) => 0.3);
-      });
-      return;
-    }
-
     setState(() {
       barHeights = List.generate(numberOfBars, (index) {
-        return 0.3 + Random().nextDouble() * 0.7;
+        if (isLocalAudioActive || isRemoteAudioActive) {
+          return 0.3 + Random().nextDouble() * 0.7;
+        }
+        return 0.3;
+      });
+    });
+  }
+
+  void _connectToSignalingServer() {
+    socket = IO.io('http://localhost:4000', <String, dynamic>{
+      'transports': ['websocket'],
+      'autoConnect': false,
+    });
+
+    socket.onConnect((_) {
+      print('Connected to signaling server');
+      setState(() {
+        connectionStatus = 'Joining room...';
+      });
+      socket.emit('join', roomId);
+    });
+
+    // Add room status handling
+    socket.on('room_status', (data) {
+      print('Room status: $data');
+      setState(() {
+        isRoomFull = data['isRoomFull'] ?? false;
+        connectionStatus =
+            'Room size: ${data['size']} ${isRoomFull ? '(Full)' : ''}';
+      });
+      if (data['size'] == 1 && !isRoomFull) {
+        _isOfferer = true;
+        _createOffer();
+      }
+    });
+
+    socket.on('room_full', (data) {
+      print('Room is full');
+      setState(() {
+        connectionStatus = 'Room is full. Please try another room.';
+        isRoomFull = true;
+      });
+    });
+
+    socket.on('room_closed', (data) {
+      if (data['roomId'] == roomId) {
+        setState(() {
+          isRoomFull = true;
+        });
+      }
+    });
+
+    socket.on('room_available', (data) {
+      if (data['roomId'] == roomId) {
+        setState(() {
+          isRoomFull = false;
+        });
+      }
+    });
+
+    socket.on('offer', (data) async {
+      print('Received offer');
+      if (!_isOfferer) {
+        await peerConnection?.setRemoteDescription(
+          RTCSessionDescription(data['sdp'], data['type']),
+        );
+        final answer = await peerConnection?.createAnswer();
+        await peerConnection?.setLocalDescription(answer!);
+        socket.emit('answer', {
+          'roomId': roomId,
+          'type': answer?.type,
+          'sdp': answer?.sdp,
+        });
+      }
+    });
+
+    socket.on('answer', (data) async {
+      print('Received answer');
+      if (_isOfferer) {
+        await peerConnection?.setRemoteDescription(
+          RTCSessionDescription(data['sdp'], data['type']),
+        );
+      }
+    });
+
+    socket.on('ice_candidate', (data) async {
+      print('Received ICE candidate');
+      await peerConnection?.addCandidate(
+        RTCIceCandidate(
+          data['candidate'],
+          data['sdpMid'],
+          data['sdpMLineIndex'],
+        ),
+      );
+    });
+
+    socket.connect();
+  }
+
+  Future<void> _createOffer() async {
+    final offer = await peerConnection!.createOffer();
+    await peerConnection!.setLocalDescription(offer);
+
+    socket.emit('offer', {
+      'roomId': roomId,
+      'type': offer.type,
+      'sdp': offer.sdp,
+    });
+  }
+
+  Widget _buildRoomInput() {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 20),
+      child: TextField(
+        decoration: InputDecoration(
+          labelText: 'Room ID',
+          hintText: 'Enter room ID',
+          border: OutlineInputBorder(),
+          suffixIcon: IconButton(
+            icon: Icon(Icons.login),
+            onPressed: isRoomFull
+                ? null
+                : () {
+                    if (roomId.isNotEmpty) {
+                      socket.emit('join', roomId);
+                    }
+                  },
+          ),
+        ),
+        onChanged: (value) => roomId = value,
+        enabled: !isRoomFull,
+      ),
+    );
+  }
+
+  void _setVolume(double value) {
+    setState(() {
+      _volume = value;
+      remoteStream?.getAudioTracks().forEach((track) {
+        track.getSettings();
       });
     });
   }
@@ -503,6 +676,8 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage>
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
+            _buildRoomInput(),
+            const SizedBox(height: 20),
             Text(
               connectionStatus,
               style: Theme.of(context).textTheme.titleMedium,
@@ -597,6 +772,27 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage>
               'Remote Audio Status: ${isRemoteAudioActive ? "Active" : "Silent"}',
               style: Theme.of(context).textTheme.bodyLarge,
             ),
+            const SizedBox(height: 20),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                const Icon(Icons.volume_down),
+                SizedBox(
+                  width: 200,
+                  child: Slider(
+                    value: _volume,
+                    min: 0.0,
+                    max: 1.0,
+                    onChanged: _setVolume,
+                  ),
+                ),
+                const Icon(Icons.volume_up),
+              ],
+            ),
+            Text(
+              'Volume: ${(_volume * 100).toInt()}%',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
           ],
         ),
       ),
@@ -605,9 +801,11 @@ class WalkieTalkiePageState extends State<WalkieTalkiePage>
 
   @override
   void dispose() {
+    socket.disconnect();
     _animationController.dispose();
     _connectionTimer?.cancel();
     audioLevelTimer?.cancel();
+    localAudioLevelTimer?.cancel();
     localStream?.dispose();
     remoteStream?.dispose();
     peerConnection?.dispose();
